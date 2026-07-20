@@ -1,0 +1,28 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+dollarpath/artifacts/**
+!dollarpath/artifacts/.gitkeep
+# Keep phase gate proof cards
+!dollarpath/artifacts/phase_p0_gate/
+!dollarpath/artifacts/phase_p0_gate/**
+!dollarpath/artifacts/phase_p1_gate/
+!dollarpath/artifacts/phase_p1_gate/**
+!dollarpath/artifacts/phase_p2_gate/
+!dollarpath/artifacts/phase_p2_gate/**
+!dollarpath/artifacts/phase_p3_gate/
+!dollarpath/artifacts/phase_p3_gate/**
+data_cache/
+*.db
+.coverage
+htmlcov/
+
+# Nested independent git repos (own remotes)
+Agent_Pidgeon/
+clawswarmed/
