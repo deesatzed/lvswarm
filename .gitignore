@@ -9,15 +9,18 @@ __pycache__/
 .DS_Store
 dollarpath/artifacts/**
 !dollarpath/artifacts/.gitkeep
-# Keep phase gate proof cards
-!dollarpath/artifacts/phase_p0_gate/
-!dollarpath/artifacts/phase_p0_gate/**
-!dollarpath/artifacts/phase_p1_gate/
-!dollarpath/artifacts/phase_p1_gate/**
-!dollarpath/artifacts/phase_p2_gate/
-!dollarpath/artifacts/phase_p2_gate/**
-!dollarpath/artifacts/phase_p3_gate/
-!dollarpath/artifacts/phase_p3_gate/**
+# Keep phase gate proof cards only
+!dollarpath/artifacts/phase_*/
+!dollarpath/artifacts/phase_*/**
+
+fairshare/artifacts/**
+!fairshare/artifacts/phase_*/
+!fairshare/artifacts/phase_*/**
+
+artifacts/**
+!artifacts/phase_*/
+!artifacts/phase_*/**
+
 data_cache/
 *.db
 .coverage

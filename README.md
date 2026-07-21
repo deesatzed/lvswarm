@@ -10,12 +10,20 @@ This is **not** a live trading product under the current goal. It is a measurabl
 
 | Document | Purpose |
 |---|---|
-| **[GOAL.md](GOAL.md)** | Autonomous agent contract — outcome, gates, non-goals, claim language |
-| **[BUILD_TODO.md](BUILD_TODO.md)** | Ordered build checklist with validation gates (no time estimates) |
-| **[docs/WHITEPAPER.md](docs/WHITEPAPER.md)** | Full white paper: problem, RL formulation, architecture, eval, phases |
+| **[GOAL_GLASSGATE_CONTROL.md](GOAL_GLASSGATE_CONTROL.md)** | Glass Gate attention control (synthetic sealed) |
+| [GOAL_FAIRSHARE_V2.md](GOAL_FAIRSHARE_V2.md) | Fairshare frontier |
+| [GOAL_FAIRSHARE.md](GOAL_FAIRSHARE.md) | Fairshare v1 |
+| [GOAL_REBAL_V3.md](GOAL_REBAL_V3.md) | Finance rebalance frontier (characterized) |
+| [GOAL_REBAL.md](GOAL_REBAL.md) | Rebal v2 multi-battery |
+| [GOAL_REBALANCE.md](GOAL_REBALANCE.md) | v1 rebalance goal (single-cost FAIL) |
+| [prereg/PREREG_REBAL_V2.md](prereg/PREREG_REBAL_V2.md) | Sealed rebal v2 experiment |
+| [GOAL_NEXT.md](GOAL_NEXT.md) | Prior path DPL-1 (constrained allocation; FAIL_B2) |
+| [prereg/PREREG_PROSPECTIVE_V1.md](prereg/PREREG_PROSPECTIVE_V1.md) | Leakage-resistant prospective experiment design |
+| [docs/NEXT_STEPS_METHODOLOGY.md](docs/NEXT_STEPS_METHODOLOGY.md) | Rationale, real faux-$ tests, methodology upgrades |
+| [GOAL.md](GOAL.md) | v1 contract (P0–P3) — completed with scoped historical pass |
+| [BUILD_TODO.md](BUILD_TODO.md) | Ordered build checklist with validation gates |
+| [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | Full white paper |
 | [END_GOAL_DOLLARS_OVER_TIME.md](END_GOAL_DOLLARS_OVER_TIME.md) | Plain-language north star |
-| [PORTFOLIO_PREDICTION_EXPERT_ANALYSIS.md](PORTFOLIO_PREDICTION_EXPERT_ANALYSIS.md) | Prediction KB + expert value/inverse |
-| [AUTOBALANCE_CONTEXTS_TOP5.md](AUTOBALANCE_CONTEXTS_TOP5.md) | External autobalance domains + local testability |
 
 ---
 
@@ -48,8 +56,25 @@ Failure of that test is a valid scientific outcome (`SCOPED_HISTORICAL_SOTA_FAIL
 |---|---|
 | White paper | Written |
 | Build checklist | P0–P3 gates closed |
-| GOAL contract | **DONE** — `SCOPED_HISTORICAL_SOTA_PASS` |
-| `dollarpath/` package | Implemented; CLI + tests green |
+| GOAL v1 (P0–P3) | **DONE** — `SCOPED_HISTORICAL_SOTA_PASS` (unconstrained held-out) |
+| GOAL_REBAL_V3 | **DONE** — `SCOPED_REBAL_V3_COMPLETE`: break-even ~**1.75 bps**; band **7%+full** can beat never @2.5bps; bootstrap CIs wide (include 0) |
+| GOAL_REBAL v2 | **DONE** — dual flags; COST_REGIME PASS; WEALTH_EDGE FAIL @2.5bps |
+| GOAL_REBALANCE v1 | **DONE** — `SCOPED_REBALANCE_FAIL` at 2.5 bps equal-weight |
+| GOAL_NEXT (DPL-1) | **DONE** — `SCOPED_PROSPECTIVE_FAIL_B2` (constrained allocation) |
+| `dollarpath/` package | Prospective protocol + CLI; tests green |
+
+### DPL-1 official (GOAL_NEXT)
+
+Sealed prospective path 2020-01-02 → 2024-12-31, max weight 40% / ≥3 names (B2):
+
+| Arm | Ending wealth (norm. $100k at T_start) |
+|---|---:|
+| A0 hold_equal | **$168,444** |
+| B2 constrained select | $165,690 (FAIL vs A0) |
+| A1 hold_qqq | $245,952 |
+| B1 unconstrained | $188,935 |
+
+Artifacts: `dollarpath/artifacts/prospective_official_seed_42_2020-01-02_2024-12-31/`
 
 ### Held-out result (prereg P3)
 

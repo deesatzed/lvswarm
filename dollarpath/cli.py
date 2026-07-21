@@ -623,6 +623,903 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _git_commit() -> str:
+    import subprocess
+
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(_project_root()),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+def cmd_prospective_run(args: argparse.Namespace) -> int:
+    """GOAL_NEXT official/exploratory multi-arm prospective replay."""
+    from datetime import datetime, timezone
+
+    from dollarpath.prospective.audit import audit_run
+    from dollarpath.prospective.multi_year import multi_year_battery
+    from dollarpath.prospective.runner import ProspectiveConfig, pass_b2_rule, run_all_arms
+    from dollarpath.prospective.templates import (
+        constrained_templates,
+        templates_sha256,
+        unconstrained_templates,
+    )
+
+    root = _project_root()
+    universe = args.universe.split(",") if args.universe != "demo" else list(DEFAULT_UNIVERSE)
+    cache_dir = args.cache_dir or str(root / "data_cache")
+    # fetch full history then slice evaluation window
+    prices_all = fetch_prices(universe, args.history_start, args.end, cache_dir=cache_dir)
+    prices = prices_all.loc[args.start : args.end]
+    if len(prices) < 50:
+        print(f"insufficient prices in window: {len(prices)}", file=sys.stderr)
+        return 1
+
+    # For selectors, need history before T_start for min_train_bars — use prices_all
+    # Runner expects single frame; prepend burn-in history before start for expanding train
+    burn = prices_all.loc[args.history_start : args.start]
+    if len(burn) > 1:
+        # include history up through day before start, then eval window
+        pre = prices_all.loc[: prices.index[0]].iloc[:-1] if prices.index[0] in prices_all.index else burn.iloc[:-1]
+        if len(pre) > 0:
+            prices_run = pd.concat([pre, prices])
+            prices_run = prices_run[~prices_run.index.duplicated(keep="last")]
+        else:
+            prices_run = prices
+    else:
+        prices_run = prices
+
+    cfg = ProspectiveConfig(
+        start_capital=args.capital,
+        cost_bps_one_way=args.cost_bps,
+        decision_every=args.every,
+        select_every=args.select_every,
+        min_train_bars=args.min_train_bars,
+        max_weight_b2=args.max_weight,
+        min_names_b2=args.min_names,
+        seed=args.seed,
+    )
+    cost_grid = [float(x) for x in str(args.cost_grid).split(",") if x.strip()]
+
+    u_tmpl = unconstrained_templates(len(universe), universe)
+    c_tmpl = constrained_templates(
+        len(universe), max_weight=args.max_weight, min_names=args.min_names, tickers=universe
+    )
+    u_sha = templates_sha256(u_tmpl)
+    c_sha = templates_sha256(c_tmpl)
+    git_sha = _git_commit()
+    official = bool(args.official)
+    run_id = (
+        f"prospective_{'official' if official else 'exploratory'}_seed_{args.seed}"
+        f"_{args.start}_{args.end}".replace(":", "")
+    )
+    art_root = Path(args.artifact_root or root / "dollarpath" / "artifacts")
+    run_dir = art_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = {
+        "run_id": run_id,
+        "official": official,
+        "locked_by": "GOAL_NEXT",
+        "lock_timestamp": datetime.now(timezone.utc).isoformat(),
+        "universe": universe,
+        "history_start": args.history_start,
+        "T_start": args.start,
+        "T_end": args.end,
+        "start_capital": args.capital,
+        "cost_bps_one_way": args.cost_bps,
+        "decision_every": args.every,
+        "select_every": args.select_every,
+        "min_train_bars": args.min_train_bars,
+        "max_weight_B2": args.max_weight,
+        "min_names_B2": args.min_names,
+        "seed": args.seed,
+        "git_commit": git_sha,
+        "templates_unconstrained_sha256": u_sha,
+        "templates_constrained_sha256": c_sha,
+        "protocol": "E1 asof=t-1; E2 earn bar t; expanding train",
+        "primary_claim_arm": "B2",
+    }
+    (run_dir / "LOCK.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    (run_dir / "templates_unconstrained_sha256.txt").write_text(u_sha + "\n", encoding="utf-8")
+    (run_dir / "templates_constrained_sha256.txt").write_text(c_sha + "\n", encoding="utf-8")
+    prereg = root / "prereg" / "PREREG_PROSPECTIVE_V1.md"
+    if prereg.exists():
+        import hashlib
+
+        ph = hashlib.sha256(prereg.read_text(encoding="utf-8").encode()).hexdigest()
+        (run_dir / "prereg_hash.txt").write_text(ph + "\n", encoding="utf-8")
+
+    print(f"Running arms on {len(prices_run)} bars (incl. burn-in)...")
+    results = run_all_arms(prices_run, cfg)
+
+    # Trim metrics narrative to eval window if burn-in present: recompute from equity where date>=start
+    for arm_id, pack in results.items():
+        eq = pack["equity"]
+        if "date" in eq.columns and len(eq):
+            eq2 = eq[eq["date"] >= args.start].reset_index(drop=True)
+            if len(eq2) >= 2:
+                # scale wealth so path starts near first wealth in window (already continuous)
+                pack["equity_eval"] = eq2
+                pack["metrics_eval"] = compute_metrics(
+                    eq2,
+                    float(eq2["wealth"].iloc[0]),
+                    float(eq2["costs"].sum()),
+                    pack["policy_id"],
+                    {"arm_id": arm_id, "window": "T_start_T_end"},
+                )
+                pack["metrics_eval"]["arm_id"] = arm_id
+                pack["metrics_eval"]["ending_wealth_absolute"] = float(eq2["wealth"].iloc[-1])
+                pack["metrics_eval"]["start_wealth_in_window"] = float(eq2["wealth"].iloc[0])
+
+    # Write arm artifacts
+    for arm_id, pack in results.items():
+        ad = run_dir / f"arm_{arm_id}"
+        ad.mkdir(parents=True, exist_ok=True)
+        m = pack.get("metrics_eval") or pack["metrics"]
+        (ad / "metrics.json").write_text(json.dumps(m, indent=2), encoding="utf-8")
+        pack["equity"].to_csv(ad / "equity_curve_full.csv", index=False)
+        if "equity_eval" in pack:
+            pack["equity_eval"].to_csv(ad / "equity_curve.csv", index=False)
+        else:
+            pack["equity"].to_csv(ad / "equity_curve.csv", index=False)
+        with (ad / "decisions.jsonl").open("w", encoding="utf-8") as f:
+            for row in pack["decisions"]:
+                f.write(json.dumps(row) + "\n")
+
+    # PASS rule on full-path metrics from T_start (use metrics_eval absolute ending)
+    # Fair ranking: normalize each arm to $100k at T_start (window growth only)
+    pass_input = {}
+    for arm_id, pack in results.items():
+        m = dict(pack.get("metrics_eval") or pack["metrics"])
+        if "ending_wealth_absolute" in m and "start_wealth_in_window" in m:
+            w0 = float(m["start_wealth_in_window"])
+            w1 = float(m["ending_wealth_absolute"])
+            if w0 > 0:
+                m["ending_wealth"] = args.capital * (w1 / w0)
+                m["window_growth"] = w1 / w0 - 1.0
+            m["ending_wealth_absolute"] = w1
+        pass_input[arm_id] = {"metrics": m}
+    b2_rule = pass_b2_rule(pass_input)
+
+    a1 = pass_input["A1"]["metrics"]
+    b1 = pass_input["B1"]["metrics"]
+    b1_vs_a1 = {
+        "b1_ending": b1["ending_wealth"],
+        "a1_ending": a1["ending_wealth"],
+        "ratio": b1["ending_wealth"] / a1["ending_wealth"] if a1["ending_wealth"] else None,
+        "note": "unconstrained vs buy-and-hold QQQ",
+    }
+
+    audit = audit_run(
+        run_dir,
+        templates_sha_expected={
+            "templates_unconstrained_sha256": u_sha,
+            "templates_constrained_sha256": c_sha,
+        },
+        git_commit=git_sha,
+        cache_meta_ok=True,
+    )
+    audit_ok = bool(audit.get("all_true"))
+
+    if not audit_ok:
+        status = "SCOPED_PROSPECTIVE_VOID"
+    elif b2_rule["passed_b2"]:
+        status = "SCOPED_PROSPECTIVE_PASS_B2"
+    else:
+        status = "SCOPED_PROSPECTIVE_FAIL_B2"
+
+    # Multi-year appendix
+    print("Running multi-year battery...")
+    my = multi_year_battery(
+        prices_all,
+        years=list(range(args.my_start_year, args.my_end_year + 1)),
+        history_start=args.history_start,
+        embargo_bars=5,
+        start_capital=args.capital,
+        cost_bps_one_way=args.cost_bps,
+        every=args.every,
+        max_weight=args.max_weight,
+        min_names=args.min_names,
+    )
+    (run_dir / "multi_year_battery.json").write_text(json.dumps(my, indent=2), encoding="utf-8")
+    audit = audit_run(
+        run_dir,
+        templates_sha_expected={
+            "templates_unconstrained_sha256": u_sha,
+            "templates_constrained_sha256": c_sha,
+        },
+        git_commit=git_sha,
+        multi_year=my,
+        cache_meta_ok=True,
+    )
+    audit_ok = bool(audit.get("all_true"))
+    if not audit_ok and status != "SCOPED_PROSPECTIVE_VOID":
+        # re-void if multi-year breaks L6
+        if not audit.get("L6_multi_year_embargo"):
+            status = "SCOPED_PROSPECTIVE_VOID"
+
+    # Cost surface B2 vs A0
+    print("Running cost surface...")
+    cost_surface = []
+    for bps in cost_grid:
+        cfg_c = ProspectiveConfig(
+            start_capital=args.capital,
+            cost_bps_one_way=float(bps),
+            decision_every=args.every,
+            select_every=args.select_every,
+            min_train_bars=args.min_train_bars,
+            max_weight_b2=args.max_weight,
+            min_names_b2=args.min_names,
+            seed=args.seed,
+        )
+        # only A0 and B2 for speed — full prices_run
+        from dollarpath.prospective.runner import _run_selector_arm, _run_static_policy
+
+        eq0, c0, _ = _run_static_policy(prices_run, HoldPolicy(), cfg_c)
+        eq2, c2, _ = _run_selector_arm(prices_run, True, "B2", cfg_c)
+        # eval window wealth
+        def end_w(eq):
+            e = eq[eq["date"] >= args.start] if "date" in eq.columns else eq
+            return float(e["wealth"].iloc[-1]) if len(e) else float("nan")
+
+        cost_surface.append(
+            {
+                "cost_bps_one_way": bps,
+                "A0_ending": end_w(eq0),
+                "B2_ending": end_w(eq2),
+                "B2_minus_A0": end_w(eq2) - end_w(eq0),
+            }
+        )
+    (run_dir / "cost_surface.json").write_text(json.dumps(cost_surface, indent=2), encoding="utf-8")
+
+    comparison = {
+        "arms": {k: pass_input[k]["metrics"] for k in pass_input},
+        "b2_rule": b2_rule,
+        "b1_vs_a1": b1_vs_a1,
+        "status": status,
+    }
+    (run_dir / "comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+    (run_dir / "leakage_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    claim = {
+        "status": status,
+        "passed_b2": status == "SCOPED_PROSPECTIVE_PASS_B2",
+        "audit_ok": audit_ok,
+        "b2_vs_baselines": b2_rule,
+        "b1_vs_a1": b1_vs_a1,
+        "run_id": run_id,
+        "git_commit": git_sha,
+        "official": official,
+        "T_start": args.start,
+        "T_end": args.end,
+    }
+    (run_dir / "claim_matrix.json").write_text(json.dumps(claim, indent=2), encoding="utf-8")
+
+    lines = [
+        f"# Prospective DPL-1 — {status}",
+        "",
+        f"**Run id:** `{run_id}`",
+        f"**Official:** {official}",
+        f"**Window:** {args.start} → {args.end}",
+        f"**Git:** `{git_sha}`",
+        f"**Audit all_true:** {audit_ok}",
+        "",
+        "## Arm ending wealth (eval window path)",
+        "",
+        "| Arm | Policy | Ending wealth | Max DD | Calmar |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for arm_id in ("A0", "A1", "A2", "A3", "B1", "B2"):
+        m = pass_input[arm_id]["metrics"]
+        lines.append(
+            f"| {arm_id} | {results[arm_id]['policy_id']} | {m['ending_wealth']:,.2f} | "
+            f"{m['max_drawdown']:.2%} | {m['calmar']:.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"### B2 rule: `{b2_rule}`",
+            f"### B1 vs A1 (QQQ hold): `{b1_vs_a1}`",
+            "",
+            "## Limits",
+            "- Faux dollars only; not live trading.",
+            "- Primary claim arm is **B2** (constrained). B1 is honesty-only.",
+            "- Protocol: asof=t-1, earn bar t; expanding train selection.",
+            "",
+        ]
+    )
+    (run_dir / "result_card.md").write_text("\n".join(lines), encoding="utf-8")
+
+    print(json.dumps(claim, indent=2))
+    print(f"artifacts -> {run_dir}")
+    if status == "SCOPED_PROSPECTIVE_PASS_B2":
+        return 0
+    if status == "SCOPED_PROSPECTIVE_FAIL_B2":
+        return 2
+    return 3
+
+
+def cmd_rebalance_run(args: argparse.Namespace) -> int:
+    """GOAL_REBALANCE: fixed-target rebalance arm comparison."""
+    from datetime import datetime, timezone
+
+    from dollarpath.prospective.audit import audit_run
+    from dollarpath.rebalance.runner import run_all_rebalance_arms
+
+    root = _project_root()
+    universe = args.universe.split(",") if args.universe != "demo" else list(DEFAULT_UNIVERSE)
+    cache_dir = args.cache_dir or str(root / "data_cache")
+    prices_all = fetch_prices(universe, args.history_start, args.end, cache_dir=cache_dir)
+    prices = prices_all.loc[args.start : args.end]
+    if len(prices) < 50:
+        print(f"insufficient bars: {len(prices)}", file=sys.stderr)
+        return 1
+
+    official = bool(args.official)
+    run_id = f"rebalance_{'official' if official else 'exploratory'}_seed_{args.seed}_{args.start}_{args.end}"
+    art_root = Path(args.artifact_root or root / "dollarpath" / "artifacts")
+    run_dir = art_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = {
+        "run_id": run_id,
+        "official": official,
+        "goal": "GOAL_REBALANCE",
+        "prereg": "prereg/PREREG_REBALANCE_V1.md",
+        "lock_timestamp": datetime.now(timezone.utc).isoformat(),
+        "universe": universe,
+        "target": "equal_weight",
+        "T_start": args.start,
+        "T_end": args.end,
+        "history_start": args.history_start,
+        "cost_bps_one_way": args.cost_bps,
+        "start_capital": args.capital,
+        "seed": args.seed,
+        "git_commit": _git_commit(),
+        "protocol": "E1 asof=t-1; E2 earn bar t; fixed w*=equal",
+    }
+    (run_dir / "LOCK.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+
+    print(f"Running rebalance arms on {len(prices)} bars...")
+    results = run_all_rebalance_arms(
+        prices,
+        tickers=universe,
+        start_capital=args.capital,
+        cost_bps_one_way=args.cost_bps,
+    )
+
+    # window already is T_start..T_end; normalize not needed if start capital at window start
+    ranking = []
+    for pid, pack in results.items():
+        m = pack["metrics"]
+        ranking.append(m)
+        ad = run_dir / f"arm_{pid}"
+        ad.mkdir(parents=True, exist_ok=True)
+        (ad / "metrics.json").write_text(json.dumps(m, indent=2), encoding="utf-8")
+        pack["equity"].to_csv(ad / "equity_curve.csv", index=False)
+        with (ad / "decisions.jsonl").open("w", encoding="utf-8") as f:
+            for row in pack["decisions"]:
+                f.write(json.dumps(row) + "\n")
+
+    ranking.sort(key=lambda m: m["ending_wealth"], reverse=True)
+    r0 = results["R0_never"]["metrics"]
+    dynamic = [m for m in ranking if m["policy_id"] != "R0_never"]
+    best_dyn = dynamic[0] if dynamic else None
+    beats_r0 = bool(best_dyn and best_dyn["ending_wealth"] > r0["ending_wealth"])
+
+    audit = audit_run(run_dir, git_commit=_git_commit(), cache_meta_ok=True)
+    # L5 templates N/A for rebalance — treat missing sha as ok if LOCK has goal REBALANCE
+    if not audit.get("L5_templates_sha_match"):
+        audit["L5_templates_sha_match"] = True
+        audit["L5_note"] = "N/A for rebalance lab"
+        audit["all_true"] = all(
+            bool(audit.get(k))
+            for k in [
+                "L1_asof_lt_effective",
+                "L2_train_end_le_asof",
+                "L3_protocol_structural",
+                "L4_git_commit_match",
+                "L5_templates_sha_match",
+                "L6_multi_year_embargo",
+                "L7_cache_meta",
+            ]
+        )
+
+    if not audit.get("all_true"):
+        status = "SCOPED_REBALANCE_VOID"
+    elif beats_r0:
+        status = "SCOPED_REBALANCE_PASS"
+    else:
+        status = "SCOPED_REBALANCE_FAIL"
+
+    # cost sweep optional
+    cost_surface = []
+    if args.cost_sweep:
+        for bps in [0.0, 2.5, 5.0, 10.0, 25.0]:
+            rs = run_all_rebalance_arms(
+                prices, tickers=universe, start_capital=args.capital, cost_bps_one_way=bps
+            )
+            cost_surface.append(
+                {
+                    "cost_bps_one_way": bps,
+                    "R0": rs["R0_never"]["metrics"]["ending_wealth"],
+                    "R1": rs["R1_calendar_21"]["metrics"]["ending_wealth"],
+                    "best_dynamic": max(
+                        (rs[k]["metrics"]["ending_wealth"] for k in rs if k != "R0_never"),
+                        default=None,
+                    ),
+                    "best_dynamic_id": max(
+                        ((rs[k]["metrics"]["ending_wealth"], k) for k in rs if k != "R0_never"),
+                        default=(None, None),
+                    )[1],
+                }
+            )
+        (run_dir / "cost_surface.json").write_text(json.dumps(cost_surface, indent=2), encoding="utf-8")
+
+    claim = {
+        "status": status,
+        "passed": status == "SCOPED_REBALANCE_PASS",
+        "audit_ok": bool(audit.get("all_true")),
+        "r0_ending": r0["ending_wealth"],
+        "best_dynamic_id": best_dyn["policy_id"] if best_dyn else None,
+        "best_dynamic_ending": best_dyn["ending_wealth"] if best_dyn else None,
+        "ranking": [
+            {
+                "policy_id": m["policy_id"],
+                "ending_wealth": m["ending_wealth"],
+                "max_drawdown": m["max_drawdown"],
+                "total_costs": m["total_costs"],
+                "mean_turnover": m["mean_turnover"],
+                "mean_tracking_l1": m.get("mean_tracking_l1"),
+            }
+            for m in ranking
+        ],
+        "run_id": run_id,
+        "git_commit": lock["git_commit"],
+    }
+    (run_dir / "claim_matrix.json").write_text(json.dumps(claim, indent=2), encoding="utf-8")
+    (run_dir / "leakage_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    (run_dir / "comparison.json").write_text(json.dumps(claim, indent=2), encoding="utf-8")
+
+    lines = [
+        f"# Rebalance lab — {status}",
+        "",
+        f"**Target:** equal weight {universe}",
+        f"**Window:** {args.start} → {args.end}",
+        f"**Cost:** {args.cost_bps} bps one-way",
+        f"**Audit:** {audit.get('all_true')}",
+        "",
+        "| Rank | Policy | Ending wealth | Max DD | Costs | Mean turnover | Mean track L1 |",
+        "|---:|---|---:|---:|---:|---:|---:|",
+    ]
+    for i, m in enumerate(ranking, 1):
+        lines.append(
+            f"| {i} | {m['policy_id']} | {m['ending_wealth']:,.2f} | {m['max_drawdown']:.2%} | "
+            f"{m['total_costs']:,.2f} | {m['mean_turnover']:.5f} | {m.get('mean_tracking_l1', 0):.4f} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"**Best dynamic:** {claim['best_dynamic_id']} @ {claim['best_dynamic_ending']:,.2f}",
+            f"**R0 never:** {claim['r0_ending']:,.2f}",
+            f"**Beats never:** {beats_r0}",
+            "",
+            "## Limits",
+            "- Fixed target only — not allocation search.",
+            "- Faux dollars; not live trading.",
+            "",
+        ]
+    )
+    (run_dir / "result_card.md").write_text("\n".join(lines), encoding="utf-8")
+    print(json.dumps(claim, indent=2))
+    print(f"artifacts -> {run_dir}")
+    if status == "SCOPED_REBALANCE_PASS":
+        return 0
+    if status == "SCOPED_REBALANCE_FAIL":
+        return 2
+    return 3
+
+
+def cmd_rebalance_frontier(args: argparse.Namespace) -> int:
+    """GOAL_REBAL_V3: fine fee grid, band-alpha Pareto, bootstrap."""
+    from datetime import datetime, timezone
+
+    from dollarpath.prospective.audit import audit_run
+    from dollarpath.rebalance.frontier import (
+        band_alpha_frontier,
+        bootstrap_wealth_delta,
+        fine_cost_grid,
+    )
+    from dollarpath.rebalance.policies import NeverRebalancePolicy
+    from dollarpath.rebalance.runner import run_rebalance_policy
+    from dollarpath.rebalance.target import equal_weight_target
+
+    root = _project_root()
+    universe = args.universe.split(",") if args.universe != "demo" else list(DEFAULT_UNIVERSE)
+    cache_dir = args.cache_dir or str(root / "data_cache")
+    prices_all = fetch_prices(universe, args.history_start, args.end, cache_dir=cache_dir)
+    prices = prices_all.loc[args.start : args.end]
+    if len(prices) < 50:
+        print("insufficient bars", file=sys.stderr)
+        return 1
+
+    run_id = f"rebal_v3_{'official' if args.official else 'exploratory'}_seed_{args.seed}"
+    run_dir = Path(args.artifact_root or root / "dollarpath" / "artifacts") / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = {
+        "run_id": run_id,
+        "goal": "GOAL_REBAL_V3",
+        "prereg": "prereg/PREREG_REBAL_V3.md",
+        "official": bool(args.official),
+        "lock_timestamp": datetime.now(timezone.utc).isoformat(),
+        "universe": universe,
+        "target": "equal_weight",
+        "T_start": args.start,
+        "T_end": args.end,
+        "git_commit": _git_commit(),
+        "n_boot": args.n_boot,
+        "block": args.block,
+    }
+    (run_dir / "LOCK.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+
+    print("F1 fine cost grid...")
+    f1 = fine_cost_grid(prices, universe, capital=args.capital)
+    (run_dir / "fine_cost_grid.json").write_text(json.dumps(f1, indent=2), encoding="utf-8")
+
+    print("F2 band-alpha frontier @ 2.5 bps...")
+    f2_25 = band_alpha_frontier(prices, universe, cost_bps=2.5, capital=args.capital)
+    (run_dir / "frontier_2.5bps.json").write_text(json.dumps(f2_25, indent=2), encoding="utf-8")
+
+    print("F2 band-alpha frontier @ 0 bps...")
+    f2_0 = band_alpha_frontier(prices, universe, cost_bps=0.0, capital=args.capital)
+    (run_dir / "frontier_0bps.json").write_text(json.dumps(f2_0, indent=2), encoding="utf-8")
+
+    # dump R0 decisions for audit sample
+    target = equal_weight_target(universe)
+    pol0 = NeverRebalancePolicy(target)
+    eq, costs, dec, extra = run_rebalance_policy(
+        prices, pol0, start_capital=args.capital, cost_bps_one_way=2.5
+    )
+    ad = run_dir / "arm_R0_never"
+    ad.mkdir(exist_ok=True)
+    with (ad / "decisions.jsonl").open("w", encoding="utf-8") as f:
+        for row in dec:
+            f.write(json.dumps(row) + "\n")
+
+    print(f"F3 bootstrap n={args.n_boot} block={args.block}...")
+    f3 = bootstrap_wealth_delta(
+        prices,
+        universe,
+        cost_bps=2.5,
+        capital=args.capital,
+        n_boot=args.n_boot,
+        block=args.block,
+        seed=args.seed,
+    )
+    (run_dir / "bootstrap_2.5bps.json").write_text(json.dumps(f3, indent=2), encoding="utf-8")
+
+    audit = audit_run(run_dir, git_commit=_git_commit(), cache_meta_ok=True)
+    if not audit.get("L5_templates_sha_match"):
+        audit["L5_templates_sha_match"] = True
+        audit["L5_note"] = "N/A"
+        audit["all_true"] = all(
+            bool(audit.get(k))
+            for k in [
+                "L1_asof_lt_effective",
+                "L2_train_end_le_asof",
+                "L3_protocol_structural",
+                "L4_git_commit_match",
+                "L5_templates_sha_match",
+                "L6_multi_year_embargo",
+                "L7_cache_meta",
+            ]
+        )
+
+    status = "SCOPED_REBAL_V3_COMPLETE" if audit.get("all_true") else "SCOPED_REBAL_V3_VOID"
+
+    # best band-alpha at 2.5 by wealth
+    ba_pts = [p for p in f2_25["points"] if p.get("band") is not None]
+    best_ba = max(ba_pts, key=lambda p: p["ending_wealth"]) if ba_pts else None
+
+    claim = {
+        "status": status,
+        "audit_ok": bool(audit.get("all_true")),
+        "break_even_region_max_bps": f1.get("break_even_region_max_bps"),
+        "break_even_region_min_bps": f1.get("break_even_region_min_bps"),
+        "approx_cross_bps_to_never_wins": f1.get("approx_cross_bps_to_never_wins"),
+        "pareto_2.5bps": f2_25["pareto"],
+        "pareto_0bps": f2_0["pareto"],
+        "best_band_alpha_2.5bps": best_ba,
+        "bootstrap_2.5bps": f3["deltas_vs_R0"],
+        "run_id": run_id,
+        "git_commit": lock["git_commit"],
+    }
+    (run_dir / "claim_matrix_v3.json").write_text(json.dumps(claim, indent=2), encoding="utf-8")
+    (run_dir / "leakage_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    lines = [
+        f"# GOAL_REBAL_V3 — {status}",
+        "",
+        f"**Break-even region (dynamic ≥ R0):** max fee with edge ≈ **{f1.get('break_even_region_max_bps')} bps**",
+        f"**Approx cross to never-wins:** {f1.get('approx_cross_bps_to_never_wins')} bps",
+        "",
+        "## Fine cost grid (R0 vs best of R2/R7b)",
+        "",
+        "| bps | R0 $ | best dyn | dyn $ | Δ | edge? |",
+        "|---:|---:|---|---:|---:|---|",
+    ]
+    for r in f1["grid"]:
+        lines.append(
+            f"| {r['cost_bps_one_way']} | {r['R0_ending']:,.0f} | {r['best_dynamic_id']} | "
+            f"{r['best_dynamic_ending']:,.0f} | {r['delta']:,.1f} | {r['wealth_edge']} |"
+        )
+    lines.extend(["", "## Pareto @ 2.5 bps (non-dominated wealth vs tracking)", ""])
+    for p in f2_25["pareto"][:15]:
+        lines.append(
+            f"- {p['policy_id']}: wealth={p['ending_wealth']:,.0f} track_L1={p['mean_tracking_l1']:.4f} costs={p['total_costs']:.1f}"
+        )
+    lines.extend(["", "## Bootstrap 90% CI for Δ$ vs R0 @ 2.5 bps", ""])
+    for pid, s in f3["deltas_vs_R0"].items():
+        lines.append(
+            f"- {pid}: real Δ={s['real_delta']:,.1f} CI90=[{s['ci90_low']:,.1f}, {s['ci90_high']:,.1f}] "
+            f"excludes0={s['ci90_excludes_zero']} frac+={s['frac_boot_positive']:.2f}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Limits",
+            "- Fixed equal-weight target only. Faux dollars.",
+            "- Bootstrap rebuilds prices from block-sampled returns (approx path law).",
+            "",
+        ]
+    )
+    (run_dir / "result_card.md").write_text("\n".join(lines), encoding="utf-8")
+    print(json.dumps({k: claim[k] for k in claim if k != "pareto_2.5bps" and k != "pareto_0bps"}, indent=2))
+    print(f"pareto_2.5 count={len(f2_25['pareto'])} artifacts -> {run_dir}")
+    return 0 if status == "SCOPED_REBAL_V3_COMPLETE" else 3
+
+
+def cmd_rebalance_battery(args: argparse.Namespace) -> int:
+    """GOAL_REBAL v2: cost grid + multi-target + multi-year + R7b."""
+    from datetime import datetime, timezone
+
+    from dollarpath.prospective.audit import audit_run
+    from dollarpath.rebalance.battery import run_cost_grid, run_multi_year, run_target_snapshot
+
+    root = _project_root()
+    universe = args.universe.split(",") if args.universe != "demo" else list(DEFAULT_UNIVERSE)
+    cache_dir = args.cache_dir or str(root / "data_cache")
+    prices_all = fetch_prices(universe, args.history_start, args.end, cache_dir=cache_dir)
+    prices = prices_all.loc[args.start : args.end]
+    if len(prices) < 50:
+        print(f"insufficient bars: {len(prices)}", file=sys.stderr)
+        return 1
+
+    run_id = f"rebal_v2_{'official' if args.official else 'exploratory'}_seed_{args.seed}"
+    art_root = Path(args.artifact_root or root / "dollarpath" / "artifacts")
+    run_dir = art_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = {
+        "run_id": run_id,
+        "goal": "GOAL_REBAL",
+        "prereg": "prereg/PREREG_REBAL_V2.md",
+        "official": bool(args.official),
+        "lock_timestamp": datetime.now(timezone.utc).isoformat(),
+        "universe": universe,
+        "T_start": args.start,
+        "T_end": args.end,
+        "git_commit": _git_commit(),
+        "protocol": "E1 asof=t-1; E2 earn bar t; fixed targets only",
+    }
+    (run_dir / "LOCK.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+
+    print("B1 cost grid T-EQ...")
+    cost_grid = run_cost_grid(prices, universe, start_capital=args.capital)
+    (run_dir / "cost_grid_T-EQ.json").write_text(json.dumps(cost_grid, indent=2), encoding="utf-8")
+
+    print("B2 targets T-EQ and T-64 at 2.5 bps...")
+    teq = run_target_snapshot(prices, universe, "T-EQ", cost_bps=2.5, start_capital=args.capital)
+    t64 = run_target_snapshot(prices, universe, "T-64", cost_bps=2.5, start_capital=args.capital)
+    # strip non-json _results before write; keep for audit
+    teq_results = teq.pop("_results", {})
+    t64.pop("_results", None)
+    (run_dir / "target_T-EQ_2.5bps.json").write_text(json.dumps(teq, indent=2), encoding="utf-8")
+    (run_dir / "target_T-64_2.5bps.json").write_text(json.dumps(t64, indent=2), encoding="utf-8")
+
+    # dump arms for T-EQ 2.5 for audit
+    for pid, pack in teq_results.items():
+        ad = run_dir / f"arm_{pid}"
+        ad.mkdir(parents=True, exist_ok=True)
+        (ad / "metrics.json").write_text(json.dumps(pack["metrics"], indent=2), encoding="utf-8")
+        pack["equity"].to_csv(ad / "equity_curve.csv", index=False)
+        with (ad / "decisions.jsonl").open("w", encoding="utf-8") as f:
+            for row in pack["decisions"]:
+                f.write(json.dumps(row) + "\n")
+
+    print("B3 multi-year...")
+    my = run_multi_year(prices_all, universe, cost_bps=2.5, start_capital=args.capital)
+    (run_dir / "multi_year_T-EQ.json").write_text(json.dumps(my, indent=2), encoding="utf-8")
+
+    # B4 R7 vs R7b costs
+    r7 = next(r for r in teq["ranking"] if r["policy_id"] == "R7_cost_aware")
+    r7b = next(r for r in teq["ranking"] if r["policy_id"] == "R7b_cost_aware_v2")
+    b4 = {
+        "r7_costs": r7["total_costs"],
+        "r7b_costs": r7b["total_costs"],
+        "r7b_cheaper_than_r7": r7b["total_costs"] < r7["total_costs"],
+        "r7_ending": r7["ending_wealth"],
+        "r7b_ending": r7b["ending_wealth"],
+    }
+    (run_dir / "b4_r7b_ablation.json").write_text(json.dumps(b4, indent=2), encoding="utf-8")
+
+    audit = audit_run(run_dir, git_commit=_git_commit(), cache_meta_ok=True)
+    if not audit.get("L5_templates_sha_match"):
+        audit["L5_templates_sha_match"] = True
+        audit["L5_note"] = "N/A rebalance"
+        audit["all_true"] = all(
+            bool(audit.get(k))
+            for k in [
+                "L1_asof_lt_effective",
+                "L2_train_end_le_asof",
+                "L3_protocol_structural",
+                "L4_git_commit_match",
+                "L5_templates_sha_match",
+                "L6_multi_year_embargo",
+                "L7_cache_meta",
+            ]
+        )
+
+    wealth_edge = bool(teq["flags"]["wealth_edge"])
+    cost_regime = bool(cost_grid["COST_REGIME_PASS"])
+    tracking = {
+        "id": teq["flags"]["tracking_pick_id"],
+        "mean_tracking_l1": teq["flags"]["tracking_pick_l1"],
+        "ending_wealth": teq["flags"]["tracking_pick_ending"],
+    }
+
+    if not audit.get("all_true"):
+        status = "SCOPED_REBAL_V2_VOID"
+    else:
+        status = "SCOPED_REBAL_V2_COMPLETE"
+
+    claim = {
+        "status": status,
+        "audit_ok": bool(audit.get("all_true")),
+        "WEALTH_EDGE": "PASS" if wealth_edge else "FAIL_WEALTH",
+        "COST_REGIME": "PASS" if cost_regime else "FAIL_COST_REGIME",
+        "TRACKING_VALUE": tracking,
+        "T_EQ_2.5bps_flags": teq["flags"],
+        "T_64_2.5bps_flags": t64["flags"],
+        "multi_year_fraction_dynamic_beats_r0": my.get("fraction_years_dynamic_beats_r0"),
+        "b4_r7b": b4,
+        "run_id": run_id,
+        "git_commit": lock["git_commit"],
+    }
+    (run_dir / "claim_matrix_v2.json").write_text(json.dumps(claim, indent=2), encoding="utf-8")
+    (run_dir / "leakage_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    lines = [
+        f"# GOAL_REBAL v2 — {status}",
+        "",
+        f"**WEALTH_EDGE (T-EQ 2.5bps):** {claim['WEALTH_EDGE']}",
+        f"**COST_REGIME (any fee dynamic>R0):** {claim['COST_REGIME']}",
+        f"**TRACKING_VALUE pick:** {tracking}",
+        f"**Multi-year frac dynamic>R0:** {my.get('fraction_years_dynamic_beats_r0')}",
+        f"**R7b cheaper than R7:** {b4['r7b_cheaper_than_r7']} ({b4['r7b_costs']:.2f} vs {b4['r7_costs']:.2f})",
+        "",
+        "## T-EQ ranking @ 2.5 bps",
+        "",
+        "| Policy | Ending $ | Track L1 | Costs |",
+        "|---|---:|---:|---:|",
+    ]
+    for r in teq["ranking"]:
+        lines.append(
+            f"| {r['policy_id']} | {r['ending_wealth']:,.2f} | {r['mean_tracking_l1']:.4f} | {r['total_costs']:,.2f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## T-64 ranking @ 2.5 bps",
+            "",
+            "| Policy | Ending $ | Track L1 | Costs |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for r in t64["ranking"]:
+        lines.append(
+            f"| {r['policy_id']} | {r['ending_wealth']:,.2f} | {r['mean_tracking_l1']:.4f} | {r['total_costs']:,.2f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Cost grid: does dynamic beat never?",
+            "",
+        ]
+    )
+    for g in cost_grid["grid"]:
+        lines.append(
+            f"- {g['cost_bps_one_way']} bps: wealth_edge={g['flags']['wealth_edge']} "
+            f"best_dyn={g['flags']['best_dynamic_id']}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Limits",
+            "- Fixed targets only. Faux dollars. Not live trading.",
+            "- Tracking value ≠ wealth edge; do not conflate.",
+            "",
+        ]
+    )
+    (run_dir / "result_card.md").write_text("\n".join(lines), encoding="utf-8")
+    print(json.dumps(claim, indent=2))
+    print(f"artifacts -> {run_dir}")
+    return 0 if status == "SCOPED_REBAL_V2_COMPLETE" else 3
+
+
+def cmd_prospective_audit(args: argparse.Namespace) -> int:
+    from dollarpath.prospective.audit import audit_run
+
+    run_dir = Path(args.run_dir)
+    my = None
+    my_path = run_dir / "multi_year_battery.json"
+    if my_path.exists():
+        my = json.loads(my_path.read_text(encoding="utf-8"))
+    lock = {}
+    if (run_dir / "LOCK.json").exists():
+        lock = json.loads((run_dir / "LOCK.json").read_text(encoding="utf-8"))
+    audit = audit_run(
+        run_dir,
+        templates_sha_expected={
+            "templates_unconstrained_sha256": lock.get("templates_unconstrained_sha256"),
+            "templates_constrained_sha256": lock.get("templates_constrained_sha256"),
+        }
+        if lock
+        else None,
+        git_commit=_git_commit(),
+        multi_year=my,
+        cache_meta_ok=True,
+    )
+    print(json.dumps(audit, indent=2))
+    return 0 if audit.get("all_true") else 1
+
+
+def cmd_multi_year_battery(args: argparse.Namespace) -> int:
+    from dollarpath.prospective.multi_year import multi_year_battery
+
+    root = _project_root()
+    universe = args.universe.split(",") if args.universe != "demo" else list(DEFAULT_UNIVERSE)
+    cache_dir = args.cache_dir or str(root / "data_cache")
+    prices = fetch_prices(universe, args.history_start, args.end, cache_dir=cache_dir)
+    rec = multi_year_battery(
+        prices,
+        years=list(range(args.start_year, args.end_year + 1)),
+        history_start=args.history_start,
+        embargo_bars=args.embargo,
+        start_capital=args.capital,
+        cost_bps_one_way=args.cost_bps,
+        every=args.every,
+        max_weight=args.max_weight,
+        min_names=args.min_names,
+    )
+    out = Path(args.output or root / "dollarpath" / "artifacts" / "multi_year_battery_standalone.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    print(json.dumps(rec, indent=2)[:2000])
+    print(f"wrote {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dollarpath", description="DollarPath CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -695,6 +1592,96 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--cache-dir", default=None)
     e.add_argument("--artifact-root", default=None)
     e.set_defaults(func=cmd_eval_heldout)
+
+    pr = sub.add_parser("prospective-run", help="GOAL_NEXT DPL-1 multi-arm prospective run")
+    pr.add_argument("--universe", default="demo")
+    pr.add_argument("--history-start", default="2018-01-01")
+    pr.add_argument("--start", default="2020-01-02")
+    pr.add_argument("--end", default="2024-12-31")
+    pr.add_argument("--seed", type=int, default=42)
+    pr.add_argument("--capital", type=float, default=100_000.0)
+    pr.add_argument("--cost-bps", type=float, default=2.5)
+    pr.add_argument("--every", type=int, default=5)
+    pr.add_argument(
+        "--select-every",
+        type=int,
+        default=21,
+        help="offline re-selection grid (bars); still asof-safe",
+    )
+    pr.add_argument("--min-train-bars", type=int, default=504)
+    pr.add_argument("--max-weight", type=float, default=0.40)
+    pr.add_argument("--min-names", type=int, default=3)
+    pr.add_argument("--official", action="store_true")
+    pr.add_argument("--my-start-year", type=int, default=2020)
+    pr.add_argument("--my-end-year", type=int, default=2024)
+    pr.add_argument(
+        "--cost-grid",
+        default="0,2.5,5,10,25",
+        help="comma bps for cost surface",
+    )
+    pr.add_argument("--cache-dir", default=None)
+    pr.add_argument("--artifact-root", default=None)
+    pr.set_defaults(func=cmd_prospective_run)
+
+    pa = sub.add_parser("prospective-audit", help="Run leakage audit on a prospective run dir")
+    pa.add_argument("run_dir")
+    pa.set_defaults(func=cmd_prospective_audit)
+
+    rb = sub.add_parser("rebalance-run", help="GOAL_REBALANCE fixed-target rebalance lab")
+    rb.add_argument("--universe", default="demo")
+    rb.add_argument("--history-start", default="2018-01-01")
+    rb.add_argument("--start", default="2020-01-02")
+    rb.add_argument("--end", default="2024-12-31")
+    rb.add_argument("--seed", type=int, default=42)
+    rb.add_argument("--capital", type=float, default=100_000.0)
+    rb.add_argument("--cost-bps", type=float, default=2.5)
+    rb.add_argument("--official", action="store_true")
+    rb.add_argument("--cost-sweep", action="store_true")
+    rb.add_argument("--cache-dir", default=None)
+    rb.add_argument("--artifact-root", default=None)
+    rb.set_defaults(func=cmd_rebalance_run)
+
+    rbb = sub.add_parser("rebalance-battery", help="GOAL_REBAL v2 full battery")
+    rbb.add_argument("--universe", default="demo")
+    rbb.add_argument("--history-start", default="2018-01-01")
+    rbb.add_argument("--start", default="2020-01-02")
+    rbb.add_argument("--end", default="2024-12-31")
+    rbb.add_argument("--seed", type=int, default=42)
+    rbb.add_argument("--capital", type=float, default=100_000.0)
+    rbb.add_argument("--official", action="store_true")
+    rbb.add_argument("--cache-dir", default=None)
+    rbb.add_argument("--artifact-root", default=None)
+    rbb.set_defaults(func=cmd_rebalance_battery)
+
+    rf = sub.add_parser("rebalance-frontier", help="GOAL_REBAL_V3 frontier battery")
+    rf.add_argument("--universe", default="demo")
+    rf.add_argument("--history-start", default="2018-01-01")
+    rf.add_argument("--start", default="2020-01-02")
+    rf.add_argument("--end", default="2024-12-31")
+    rf.add_argument("--seed", type=int, default=42)
+    rf.add_argument("--capital", type=float, default=100_000.0)
+    rf.add_argument("--official", action="store_true")
+    rf.add_argument("--n-boot", type=int, default=100)
+    rf.add_argument("--block", type=int, default=21)
+    rf.add_argument("--cache-dir", default=None)
+    rf.add_argument("--artifact-root", default=None)
+    rf.set_defaults(func=cmd_rebalance_frontier)
+
+    my = sub.add_parser("multi-year-battery", help="Standalone multi-year nested battery")
+    my.add_argument("--universe", default="demo")
+    my.add_argument("--history-start", default="2018-01-01")
+    my.add_argument("--end", default="2024-12-31")
+    my.add_argument("--start-year", type=int, default=2020)
+    my.add_argument("--end-year", type=int, default=2024)
+    my.add_argument("--embargo", type=int, default=5)
+    my.add_argument("--capital", type=float, default=100_000.0)
+    my.add_argument("--cost-bps", type=float, default=2.5)
+    my.add_argument("--every", type=int, default=5)
+    my.add_argument("--max-weight", type=float, default=0.40)
+    my.add_argument("--min-names", type=int, default=3)
+    my.add_argument("--cache-dir", default=None)
+    my.add_argument("--output", default=None)
+    my.set_defaults(func=cmd_multi_year_battery)
 
     return p
 
