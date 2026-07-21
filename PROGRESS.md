@@ -1,5 +1,15 @@
 # PROGRESS.md — DollarPath
 
+## Session 2026-07-21 GOAL_GLASSGATE_CONTROL_V2
+
+- Label-free deployable controllers + oracle ceiling + multi-seed (20) + expanded bank
+- **Status:** `SCOPED_GLASSGATE_CONTROL_V2_COMPLETE`
+- DEPLOYABLE_LIFT **PASS** (Δ≈0.94, best=`deployable_anti_cue`)
+- MULTI_SEED_ROBUST **PASS** · HARM_LIMIT **PASS**
+- Oracle ceiling reported separately (~1.0 mean)
+- Artifacts: `clawswarmed/artifacts/glassgate_control_v2_seed_42/`
+- unittest v2: 5 passed
+
 ## Session 2026-07-21 GOAL_GLASSGATE_CONTROL
 
 - Created GOAL_GLASSGATE_CONTROL.md + glassgate_control.py + CLI + tests

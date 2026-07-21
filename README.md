@@ -10,7 +10,8 @@ This is **not** a live trading product under the current goal. It is a measurabl
 
 | Document | Purpose |
 |---|---|
-| **[GOAL_GLASSGATE_CONTROL.md](GOAL_GLASSGATE_CONTROL.md)** | Glass Gate attention control (synthetic sealed) |
+| **[GOAL_GLASSGATE_CONTROL_V2.md](GOAL_GLASSGATE_CONTROL_V2.md)** | Label-free Glass Gate control (primary deployable claim) |
+| [GOAL_GLASSGATE_CONTROL.md](GOAL_GLASSGATE_CONTROL.md) | Glass Gate control v1 (oracle ceiling) |
 | [GOAL_FAIRSHARE_V2.md](GOAL_FAIRSHARE_V2.md) | Fairshare frontier |
 | [GOAL_FAIRSHARE.md](GOAL_FAIRSHARE.md) | Fairshare v1 |
 | [GOAL_REBAL_V3.md](GOAL_REBAL_V3.md) | Finance rebalance frontier (characterized) |
